@@ -172,6 +172,37 @@ That is ~4.7M reads of pure noise, about 2.2% of the session, and every line of
 it was avoidable without losing a single fact. The rule of thumb that falls out:
 **a human reader wants whitespace, an agent wants one line per record.**
 
+### Three hypotheses, none of them tested
+
+Where to look in a Bun + TypeScript repo, from reading the measured one. Each
+is a guess about the mechanism, with the reads it would have to earn back; none
+has been applied or re-measured, so treat the numbers as the prize, not the
+result.
+
+1. **The runner's echo — worth 568k reads.** The gate script spawns each step
+   as `["bun", "run", ...step.args]`, and `bun run` echoes `$ <command>` before
+   every one. Adding `--silent` to that spawn should remove the echo and
+   nothing else: measured separately, `--silent` drops bun's `$ …` line and its
+   `error: script "x" exited with code N` line, and leaves the script's own
+   stdout, its stderr and the exit code untouched.
+
+2. **Timestamped log lines inside test runs — worth 1.45M reads.** The logger
+   prints `[ISO timestamp] [LEVEL] message` on every call, and has exactly one
+   suppression rule (`debug` is dropped in production). Under a test runner
+   almost none of those lines is read by anybody. A level threshold honoured by
+   the test environment is the obvious shape; the risk is that a test asserting
+   on log output starts failing, which is a fast thing to find out.
+
+3. **Pretty-printed JSON at one field per line — worth 2.46M reads.** The CLI
+   already has the cure and it is opt-in: `--tsv` renders the widest table in
+   the answer, and the guide recommends it. Nothing in the code looks at whether
+   stdout is a terminal. Defaulting to TSV when it is not — a human at a prompt
+   keeps the JSON, a piped caller gets rows — would make the cheap format the
+   automatic one without taking the readable one away.
+
+The common shape of all three: the quiet variant already exists and is not the
+default.
+
 What is *not* worth optimising, measured in the same session: whole-file writes
 (88 of them, but 84 were a file's first version — the text has to be sent once,
 and re-sending an existing file happened 4 times) and the choice between a
