@@ -172,19 +172,49 @@ That is ~4.7M reads of pure noise, about 2.2% of the session, and every line of
 it was avoidable without losing a single fact. The rule of thumb that falls out:
 **a human reader wants whitespace, an agent wants one line per record.**
 
-### Three hypotheses, none of them tested
+### Three hypotheses, one of them now applied
 
 Where to look in a Bun + TypeScript repo, from reading the measured one. Each
-is a guess about the mechanism, with the reads it would have to earn back; none
-has been applied or re-measured, so treat the numbers as the prize, not the
-result.
+is a guess about the mechanism, with the reads it would have to earn back. Only
+the first has been applied; none has been re-measured on a fresh session, so
+treat the numbers as the prize, not the result.
 
-1. **The runner's echo — worth 568k reads.** The gate script spawns each step
-   as `["bun", "run", ...step.args]`, and `bun run` echoes `$ <command>` before
-   every one. Adding `--silent` to that spawn should remove the echo and
-   nothing else: measured separately, `--silent` drops bun's `$ …` line and its
-   `error: script "x" exited with code N` line, and leaves the script's own
-   stdout, its stderr and the exit code untouched.
+1. **The runner's echo — worth 568k reads. Applied.** The gate script spawned
+   each step as `["bun", "run", ...step.args]`, and `bun run` echoes
+   `$ <command>` before every one; the gate has twelve steps, so that is twelve
+   lines per run carried to the next compaction. `--silent` now sits in that
+   spawn. Checked on the measured repository: one step loses the `$ …` line and
+   keeps its own output verbatim, and the whole gate still passes — 9 checks,
+   819 tests, exit 0. What has not been checked is the 568k itself, which needs
+   a new long session to compare against.
+
+   The echo turned out to cost more than its tokens, which is why this one went
+   first. **It goes to stderr**, so any command that merges streams before a
+   parser — the shape an agent writes constantly, `cmd 2>&1 | awk …` — hands
+   the parser that line as record 1. Seen in a live session: a `--tsv` query
+   piped into an `awk` that built its column map from `NR==1` read the header
+   out of `$ bun scripts/prod.ts …`, found no `id` column, and died with
+   `awk: illegal field $(), name "id"`. That is a whole round trip lost and
+   retried, the same class of cost as the shell quirks below, except the cause
+   is in the project. Two things follow. A runner's chatter belongs behind
+   `--silent` wherever a parser is downstream, not only in the gate — a
+   hand-typed `bun run` gets no protection from the fix above. And a script's
+   own progress lines survive `--silent`, because it only silences bun; the
+   robust form is to keep stderr out of a parsed stream (`2>/dev/null`, and
+   read the exit code) rather than to trust that line 1 is the header.
+
+   Because a hand-typed `bun run` is the common case and no project-side fix
+   reaches it, the prelude now wraps it: when bun is on `PATH`, `bun run …`
+   becomes `command bun run --silent …`, and every other `bun` invocation passes
+   through untouched. Measured on bun 1.3.14 against a script that prints to
+   stdout and exits 3, `--silent` drops two lines and nothing else — bun's
+   `$ …` echo and its `error: script "bad" exited with code 3` — while the
+   script's own output stays verbatim and the exit status is still 3. The
+   failure above, reproduced through the server and then fixed by the wrapper:
+   `bun run bad 2>&1 | awk 'NR==1{print "line1:" $0}'` answered `line1:$ sh -c …`
+   before and answers `line1:out` after. Dropping bun's error line is the reason
+   the `[exit N]` note below has to be unconditional: with the wrapper on, that
+   note is the only place a failed script still shows.
 
 2. **Timestamped log lines inside test runs — worth 1.45M reads.** The logger
    prints `[ISO timestamp] [LEVEL] message` on every call, and has exactly one
@@ -246,13 +276,85 @@ delays only itself. Worth knowing either way: **the client backgrounds an MCP
 call after 120s**, which is the real ceiling on how long a command can block a
 turn, whatever `CLAUDECUT_SH_TIMEOUT_MS` says.
 
+Two more, both found on the first session that actually ran this server rather
+than the prototype it grew out of. A timeout killed only the shell, so a
+pipeline — `cmd | tail`, which is most of what an agent writes — left its
+members alive holding the pipes, and `close` then never fired: the call was
+never answered at all, instead of answering `[timed out]`, and the orphan kept
+running. The command now gets its own process group and the timeout kills the
+group, with `exit` answering after a short flush if `close` does not come. And
+the output clipper bounded its buffer by the head, then took a head and a tail
+of *that* — past the bound it returned the middle of the output as its tail and
+understated what it had dropped. Both ends are now kept as the output arrives.
+Worth stating plainly because it is the trap the clipper exists to avoid: a
+truncated result that does not look truncated is worse than a missing one.
+
+One more, and it is the server lying rather than the shell. A command's own
+non-zero exit was reported as a failed *call*, so the client painted ordinary
+results red: `grep` with no match exits 1, and in session `de847791` 2 of 146
+calls were flagged that way with nothing wrong in them — a nudge to re-run a
+command that had already answered. The exit status is data and the `[exit N]`
+note carries it losslessly, so `isError` is now reserved for a call that did not
+run to completion: a timeout, or a shell that could not be spawned. Verified
+through the server: `grep -n nosuchstring file` answers `[exit 1]` with
+`isError=false`, `def` with no match answers `[exit 1]`, a usage error answers
+`[exit 2]`, and `timeout 1 sleep 5` still answers `142`.
+
+### Two navigation helpers, and an honest ceiling
+
+The prelude is free in context — the model never sees it, only the tool
+description — so anything that turns two round trips into one belongs there
+rather than in the schema. What to put there was read off 94 signal-forge
+sessions and 14,528 `sh` calls:
+
+| calls | share | shape |
+|---:|---:|---|
+| 686 | 4.7% | `sed -n RANGEp` — read a slice of a file |
+| 457 | 3.1% | `grep -r` — recursive search |
+| 302 | 2.1% | grep for a **declaration** |
+| 263 | 1.8% | grep with `-A`/`-B`/`-C` — a declaration plus its body |
+| 220 | 1.5% | **a pair**: one call's grep locates a file, the next one reads it |
+| 193 | 1.3% | `cat` a whole file |
+| 128 | 0.9% | **a pair**: a second slice of a file the previous call opened at the wrong range |
+
+Hence `def <symbol> [lines]`, which finds a declaration anywhere under the tree
+and prints its body, and `peek <file>:<line> [lines]`, which prints a window
+centred on a line and clamps at the top of the file. Together they are the 348
+paired calls plus most of the 565 declaration greps, and they cost ~55 tokens of
+tool description, paid once per session — about $0.01 over a session of 139
+requests.
+
+A helper that misfires is worse than the grep it replaces, because a wrong
+answer costs the round trip it was meant to save, so `def` is conservative in
+three ways, each one a bug it had first. It excludes data files by extension:
+the first version matched `collector` inside a 100 MB `.jsonl` transcript under
+`bench/` and returned it. It drops any line of 400 characters or more, since a
+declaration is short and a data blob is not. And it requires the keyword to sit
+immediately before the symbol, because the loose form reported
+`const output = collector();` as the declaration of `collector`; the loose search
+now runs only when the exact one finds nothing, and says so on stderr. When it
+misses it says `-- grep it` and exits 1 rather than answering with something
+plausible.
+
+**The ceiling on all of this is smaller than one session suggests.** Collapsing
+every run of consecutive read-only calls into a single call is worth 10.6% of
+cache reads across those 94 sessions (993 of 14,528 calls sit inside such a run,
+248M of 2.35Bn reads). Session `de847791` alone came out at 34%, which is where
+the first estimate came from, and it is an outlier — a single session is not a
+sample. The helpers address part of that 10.6%, not the whole of it: the long
+chains in `de847791` (#22–30, #82–87, #110–114, #138–144) are genuinely
+sequential code navigation, where each grep's target comes out of the previous
+answer, and no schema or prelude change makes a dependent call independent.
+
 | knob | default |
 |---|---|
-| `CLAUDECUT_CWD` | where claudecut was launched; every command starts there, and the tool description says so, which is what stops the model writing `cd /absolute/path &&` in front of 894 commands out of 908 |
+| `CLAUDECUT_CWD` | where claudecut was launched; every command starts there, and the tool description says so. Measured: 5 of 24 commands carried a `cd /absolute/path &&` prefix against 253 of 257 on a server whose description did not name the directory. The relapse is now pinned to the call in session `de847791`: no `cd` in the first 87 calls, then 53 of the last 59, starting on the first call after the seventh user message and copied forward from its own earlier line. Worth being exact about the price, because it is easy to overstate — 2,120 bytes over that session, 16k integrated cache reads, **$0.02**. The prefix is a symptom worth reading, not a cost worth chasing |
+| `def`, `peek` | defined by the prelude, guarded by `command -v` so a shell profile's own keep priority; see the helpers above |
 | `CLAUDECUT_SHELL` | `zsh` |
 | `CLAUDECUT_SH_PRELUDE` | the prelude above; set it empty to run commands verbatim |
 | `CLAUDECUT_SH_TIMEOUT_MS` | `600000` |
-| `CLAUDECUT_SH_MAX_OUTPUT` | `60000` characters, clipped head and tail |
+| `CLAUDECUT_SH_MAX_OUTPUT` | `60000` characters, kept as head and tail |
+| `CLAUDECUT_SH_FLUSH_GRACE_MS` | `200` — how long `exit` waits for the pipes before answering without `close` |
 
 ## Tier 3 — present in the binary, unverified
 
