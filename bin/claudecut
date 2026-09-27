@@ -18,7 +18,23 @@
 
 set -euo pipefail
 
-CLAUDECUT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve symlinks before locating the checkout. The README's own install is
+# `ln -s .../bin/claudecut ~/.local/bin/claudecut`, and `${BASH_SOURCE[0]}` is
+# then the symlink, not the script: the root came out as `~/.local`, and every
+# run died on `~/.local/lib/presets.sh: No such file or directory`. So the
+# documented install never worked, and an alias pointing straight at the script
+# was the only thing that did. `readlink -f` would be one line, but macOS
+# `readlink` has no `-f`; this loop is the portable form, and it follows a chain
+# of symlinks rather than just the first.
+claudecut_self="${BASH_SOURCE[0]}"
+while [ -L "$claudecut_self" ]; do
+  claudecut_link="$(readlink -- "$claudecut_self")"
+  case "$claudecut_link" in
+    /*) claudecut_self="$claudecut_link" ;;
+    *)  claudecut_self="$(cd -- "$(dirname -- "$claudecut_self")" && pwd)/$claudecut_link" ;;
+  esac
+done
+CLAUDECUT_ROOT="$(cd -- "$(dirname -- "$claudecut_self")/.." && pwd)"
 export CLAUDECUT_ROOT
 
 # Optional user overrides: CLAUDECUT_* variables, sourced before the presets.
